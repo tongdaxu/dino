@@ -19,7 +19,7 @@ import time
 import math
 import json
 from pathlib import Path
-
+import copy
 import numpy as np
 from PIL import Image
 import torch
@@ -29,7 +29,7 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
-
+from inn import PIXELVAE
 import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
@@ -43,7 +43,7 @@ def get_args_parser():
 
     # Model parameters
     parser.add_argument('--arch', default='vit_small', type=str,
-        choices=['vit_tiny', 'vit_small', 'vit_base', 'xcit', 'deit_tiny', 'deit_small'] \
+        choices=['vit_tiny', 'vit_small', 'vit_base', 'xcit', 'deit_tiny', 'deit_small', 'flow'] \
                 + torchvision_archs + torch.hub.list("facebookresearch/xcit:main"),
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
@@ -75,7 +75,7 @@ def get_args_parser():
         help='Number of warmup epochs for the teacher temperature (Default: 30).')
 
     # Training/Optimization parameters
-    parser.add_argument('--use_fp16', type=utils.bool_flag, default=True, help="""Whether or not
+    parser.add_argument('--use_fp16', type=utils.bool_flag, default=False, help="""Whether or not
         to use half precision for training. Improves training time and memory requirements,
         but can provoke instability and slight decay of performance. We recommend disabling
         mixed precision if the loss is unstable, if reducing the patch size or if training with bigger ViTs.""")
@@ -129,6 +129,24 @@ def get_args_parser():
     return parser
 
 
+class LinearClassifier(nn.Module):
+    """Linear layer to train on top of frozen features"""
+    def __init__(self, dim, num_labels=1000):
+        super(LinearClassifier, self).__init__()
+        self.dim = dim
+        self.num_labels = num_labels
+        self.linear = nn.Linear(self.dim, num_labels)
+        self.linear.weight.data.normal_(mean=0.0, std=0.01)
+        self.linear.bias.data.zero_()
+
+    def forward(self, x):
+        # flatten
+        x = x.reshape(-1, self.dim, 8, 8)
+        x_pool = F.adaptive_avg_pool2d(x, output_size=1)
+        x_pool = x_pool.view(x_pool.size(0), -1)
+        # linear layer
+        return self.linear(x_pool)
+
 def train_dino(args):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
@@ -176,6 +194,10 @@ def train_dino(args):
         student = torchvision_models.__dict__[args.arch]()
         teacher = torchvision_models.__dict__[args.arch]()
         embed_dim = student.fc.weight.shape[1]
+    elif args.arch == "flow":
+        student = PIXELVAE()
+        teacher = copy.deepcopy(student)
+        embed_dim = student.fc.weight.shape[1]
     else:
         print(f"Unknow architecture: {args.arch}")
 
@@ -198,18 +220,22 @@ def train_dino(args):
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
         # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
+        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu], find_unused_parameters=True)
         teacher_without_ddp = teacher.module
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu], find_unused_parameters=True)
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
     # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():
         p.requires_grad = False
     print(f"Student and Teacher are built: they are both {args.arch} network.")
+
+    linear_classifier = LinearClassifier(embed_dim, num_labels=1000)
+    linear_classifier = linear_classifier.cuda()
+    linear_classifier = nn.parallel.DistributedDataParallel(linear_classifier, device_ids=[args.gpu])
 
     # ============ preparing loss ... ============
     dino_loss = DINOLoss(
@@ -230,9 +256,13 @@ def train_dino(args):
     elif args.optimizer == "lars":
         optimizer = utils.LARS(params_groups)  # to use with convnet and large batches
     # for mixed precision training
-    fp16_scaler = None
-    if args.use_fp16:
-        fp16_scaler = torch.cuda.amp.GradScaler()
+
+    optimizer_linear = torch.optim.SGD(
+        linear_classifier.parameters(),
+        lr=1e-4,
+        momentum=0.9,
+        weight_decay=0, # we do not apply weight decay
+    )
 
     # ============ init schedulers ... ============
     lr_schedule = utils.cosine_scheduler(
@@ -259,7 +289,7 @@ def train_dino(args):
         student=student,
         teacher=teacher,
         optimizer=optimizer,
-        fp16_scaler=fp16_scaler,
+        fp16_scaler=None,
         dino_loss=dino_loss,
     )
     start_epoch = to_restore["epoch"]
@@ -270,9 +300,9 @@ def train_dino(args):
         data_loader.sampler.set_epoch(epoch)
 
         # ============ training one epoch of DINO ... ============
-        train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_loss,
-            data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
-            epoch, fp16_scaler, args)
+        train_stats = train_one_epoch(student, teacher, teacher_without_ddp, linear_classifier, dino_loss,
+            data_loader, optimizer, optimizer_linear, lr_schedule, wd_schedule, momentum_schedule,
+            epoch, None, args)
 
         # ============ writing logs ... ============
         save_dict = {
@@ -283,8 +313,7 @@ def train_dino(args):
             'args': args,
             'dino_loss': dino_loss.state_dict(),
         }
-        if fp16_scaler is not None:
-            save_dict['fp16_scaler'] = fp16_scaler.state_dict()
+
         utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
         if args.saveckp_freq and epoch % args.saveckp_freq == 0:
             utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
@@ -298,12 +327,12 @@ def train_dino(args):
     print('Training time {}'.format(total_time_str))
 
 
-def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loader,
-                    optimizer, lr_schedule, wd_schedule, momentum_schedule,epoch,
+def train_one_epoch(student, teacher, teacher_without_ddp, linear_classifier, dino_loss, data_loader,
+                    optimizer, optimizer_linear, lr_schedule, wd_schedule, momentum_schedule,epoch,
                     fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for it, (images, target) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -313,11 +342,35 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
+        target = target.cuda(non_blocking=True)
         # teacher and student forward passes + compute dino loss
-        with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
-            student_output = student(images)
-            loss = dino_loss(student_output, teacher_output, epoch)
+
+        image_ori = images[0]
+        teacher_output = teacher(images[1:3])  # only the 2 global views pass through the teacher
+        student_output = student(images[1:])
+        loss = dino_loss(student_output, teacher_output, epoch)
+
+        with torch.no_grad():
+            if "vit" in args.arch:
+                intermediate_output = teacher_without_ddp.get_intermediate_layers(image_ori, 4)
+                output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
+                if avgpool:
+                    output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
+                    output = output.reshape(output.shape[0], -1)
+            else:
+                output = teacher_without_ddp.backbone(image_ori)
+
+        output_norm = torch.mean(output**2)
+        output = linear_classifier(output)
+        # compute cross entropy loss
+        loss_linear = nn.CrossEntropyLoss()(output, target)
+
+        optimizer_linear.zero_grad()
+        loss_linear.backward()
+        optimizer_linear.step()
+
+        acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
+        # classification update
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -326,22 +379,12 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         # student update
         optimizer.zero_grad()
         param_norms = None
-        if fp16_scaler is None:
-            loss.backward()
-            if args.clip_grad:
-                param_norms = utils.clip_gradients(student, args.clip_grad)
-            utils.cancel_gradients_last_layer(epoch, student,
-                                              args.freeze_last_layer)
-            optimizer.step()
-        else:
-            fp16_scaler.scale(loss).backward()
-            if args.clip_grad:
-                fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
-                param_norms = utils.clip_gradients(student, args.clip_grad)
-            utils.cancel_gradients_last_layer(epoch, student,
-                                              args.freeze_last_layer)
-            fp16_scaler.step(optimizer)
-            fp16_scaler.update()
+        loss.backward()
+        if args.clip_grad:
+            param_norms = utils.clip_gradients(student, args.clip_grad)
+        utils.cancel_gradients_last_layer(epoch, student,
+                                            args.freeze_last_layer)
+        optimizer.step()
 
         # EMA update for the teacher
         with torch.no_grad():
@@ -351,6 +394,10 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
         # logging
         torch.cuda.synchronize()
+        metric_logger.meters['acc1'].update(acc1.item(), n=image_ori.shape[0])
+        metric_logger.meters['acc5'].update(acc5.item(), n=image_ori.shape[0])
+        metric_logger.meters['norm'].update(output_norm.item())
+        metric_logger.update(loss_linear=loss_linear.item())
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
@@ -430,17 +477,21 @@ class DataAugmentationDINO(object):
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
-
+        self.global_transfo0 = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(256),
+            normalize,
+        ])
         # first global crop
         self.global_transfo1 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(256, scale=global_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(1.0),
             normalize,
         ])
         # second global crop
         self.global_transfo2 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
+            transforms.RandomResizedCrop(256, scale=global_crops_scale, interpolation=Image.BICUBIC),
             flip_and_color_jitter,
             utils.GaussianBlur(0.1),
             utils.Solarization(0.2),
@@ -457,6 +508,7 @@ class DataAugmentationDINO(object):
 
     def __call__(self, image):
         crops = []
+        crops.append(self.global_transfo0(image))
         crops.append(self.global_transfo1(image))
         crops.append(self.global_transfo2(image))
         for _ in range(self.local_crops_number):

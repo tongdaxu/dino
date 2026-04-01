@@ -506,7 +506,7 @@ def accuracy(output, target, topk=(1,)):
     _, pred = output.topk(maxk, 1, True, True)
     pred = pred.t()
     correct = pred.eq(target.reshape(1, -1).expand_as(pred))
-    return [correct[:k].reshape(-1).float().sum(0) * 100. / batch_size for k in topk]
+    return [correct[:k].reshape(-1).float().sum(0) / batch_size for k in topk]
 
 
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
@@ -603,6 +603,9 @@ class MultiCropWrapper(nn.Module):
     def __init__(self, backbone, head):
         super(MultiCropWrapper, self).__init__()
         # disable layers dedicated to ImageNet labels classification
+        self.embed_dim = backbone.fc.weight.shape[1]
+        self.pool = backbone.avgpool
+        backbone.avgpool = nn.Identity()
         backbone.fc, backbone.head = nn.Identity(), nn.Identity()
         self.backbone = backbone
         self.head = head
@@ -617,7 +620,11 @@ class MultiCropWrapper(nn.Module):
         )[1], 0)
         start_idx, output = 0, torch.empty(0).to(x[0].device)
         for end_idx in idx_crops:
-            _out = self.backbone(torch.cat(x[start_idx: end_idx]))
+            d = x[start_idx].shape[2]
+            _out_no_pool = self.backbone(torch.cat(x[start_idx: end_idx]))
+            _out_no_pool = _out_no_pool.reshape(-1, self.embed_dim, d // 32, d // 32)
+            _out = self.pool(_out_no_pool)
+            _out = torch.flatten(_out, 1)
             # The output is a tuple with XCiT model. See:
             # https://github.com/facebookresearch/xcit/blob/master/xcit.py#L404-L405
             if isinstance(_out, tuple):
