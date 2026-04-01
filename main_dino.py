@@ -345,25 +345,26 @@ def train_one_epoch(student, teacher, teacher_without_ddp, linear_classifier, di
         target = target.cuda(non_blocking=True)
         # teacher and student forward passes + compute dino loss
 
-        image_ori = images[0]
-        teacher_output = teacher(images[1:3])  # only the 2 global views pass through the teacher
-        student_output = student(images[1:])
-        loss = dino_loss(student_output, teacher_output, epoch)
+        with torch.amp.autocast(dtype=torch.bfloat16, device_type='cuda', enabled=args.use_fp16):
+            image_ori = images[0]
+            teacher_output = teacher(images[1:3])  # only the 2 global views pass through the teacher
+            student_output = student(images[1:])
+            loss = dino_loss(student_output, teacher_output, epoch)
 
-        with torch.no_grad():
-            if "vit" in args.arch:
-                intermediate_output = teacher_without_ddp.get_intermediate_layers(image_ori, 4)
-                output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
-                if avgpool:
-                    output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
-                    output = output.reshape(output.shape[0], -1)
-            else:
-                output = teacher_without_ddp.backbone(image_ori)
+            with torch.no_grad():
+                if "vit" in args.arch:
+                    intermediate_output = teacher_without_ddp.get_intermediate_layers(image_ori, 4)
+                    output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
+                    if avgpool:
+                        output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
+                        output = output.reshape(output.shape[0], -1)
+                else:
+                    output = teacher_without_ddp.backbone(image_ori)
 
-        output_norm = torch.mean(output**2)
-        output = linear_classifier(output)
-        # compute cross entropy loss
-        loss_linear = nn.CrossEntropyLoss()(output, target)
+            output_norm = torch.mean(output**2)
+            output = linear_classifier(output)
+            # compute cross entropy loss
+            loss_linear = nn.CrossEntropyLoss()(output, target)
 
         optimizer_linear.zero_grad()
         loss_linear.backward()
