@@ -29,7 +29,7 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
-from inn import PIXELVAE
+from inn import PIXELVAE, PIXELVAEfast, get_psnr, unwrap_model
 import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
@@ -43,7 +43,7 @@ def get_args_parser():
 
     # Model parameters
     parser.add_argument('--arch', default='vit_small', type=str,
-        choices=['vit_tiny', 'vit_small', 'vit_base', 'xcit', 'deit_tiny', 'deit_small', 'flow'] \
+        choices=['vit_tiny', 'vit_small', 'vit_base', 'xcit', 'deit_tiny', 'deit_small', 'flow', 'flowfast'] \
                 + torchvision_archs + torch.hub.list("facebookresearch/xcit:main"),
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
@@ -198,6 +198,10 @@ def train_dino(args):
         student = PIXELVAE()
         teacher = copy.deepcopy(student)
         embed_dim = student.fc.weight.shape[1]
+    elif args.arch == "flowfast":
+        student = PIXELVAEfast()
+        teacher = copy.deepcopy(student)
+        embed_dim = student.fc.weight.shape[1]
     else:
         print(f"Unknow architecture: {args.arch}")
 
@@ -330,6 +334,8 @@ def train_dino(args):
 def train_one_epoch(student, teacher, teacher_without_ddp, linear_classifier, dino_loss, data_loader,
                     optimizer, optimizer_linear, lr_schedule, wd_schedule, momentum_schedule,epoch,
                     fp16_scaler, args):
+
+    TRAIN_DEC = True
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
     for it, (images, target) in enumerate(metric_logger.log_every(data_loader, 10, header)):
@@ -347,19 +353,25 @@ def train_one_epoch(student, teacher, teacher_without_ddp, linear_classifier, di
 
         with torch.amp.autocast(dtype=torch.bfloat16, device_type='cuda', enabled=args.use_fp16):
             image_ori = images[0]
-            teacher_output = teacher(images[1:3])  # only the 2 global views pass through the teacher
-            student_output = student(images[1:])
-            loss = dino_loss(student_output, teacher_output, epoch)
+            image_global = torch.cat(images[1:3], dim=0)
+            teacher_output, _, _ = teacher(images[1:3], is_student=False)  # only the 2 global views pass through the teacher
+            student_output, znorm, xrecon = student(images[1:], is_student=TRAIN_DEC)
+            if TRAIN_DEC:
+                dloss = dino_loss(student_output, teacher_output, epoch)
+                xloss = torch.mean((image_global - xrecon)**2)
+                last_layer = unwrap_model(student).get_last_layer()
+                dloss_grad = torch.autograd.grad(dloss, last_layer, retain_graph=True)[0]
+                xloss_grad = torch.autograd.grad(xloss, last_layer, retain_graph=True)[0]
+                xweight = torch.norm(dloss_grad) / (torch.norm(xloss_grad) + 1e-4)
+                xweight = torch.clamp(xweight, 0.0, 1e4).detach()
+                loss = dloss + xloss * xweight * 0.1
+                psnr = torch.mean(get_psnr(image_global, xrecon, zero_mean=True))    
+            else:
+                loss = dino_loss(student_output, teacher_output, epoch)
+                psnr = torch.zeros_like(loss)
 
             with torch.no_grad():
-                if "vit" in args.arch:
-                    intermediate_output = teacher_without_ddp.get_intermediate_layers(image_ori, 4)
-                    output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
-                    if avgpool:
-                        output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
-                        output = output.reshape(output.shape[0], -1)
-                else:
-                    output = teacher_without_ddp.backbone(image_ori)
+                output, _ = teacher_without_ddp.backbone(image_ori, is_student=False)
 
             output_norm = torch.mean(output**2)
             output = linear_classifier(output)
@@ -398,6 +410,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, linear_classifier, di
         metric_logger.meters['acc1'].update(acc1.item(), n=image_ori.shape[0])
         metric_logger.meters['acc5'].update(acc5.item(), n=image_ori.shape[0])
         metric_logger.meters['norm'].update(output_norm.item())
+        metric_logger.meters['psnr'].update(psnr.item())
         metric_logger.update(loss_linear=loss_linear.item())
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
@@ -476,7 +489,8 @@ class DataAugmentationDINO(object):
         ])
         normalize = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            # transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)), # (-1, 1)
         ])
         self.global_transfo0 = transforms.Compose([
             transforms.Resize(256),

@@ -610,7 +610,7 @@ class MultiCropWrapper(nn.Module):
         self.backbone = backbone
         self.head = head
 
-    def forward(self, x):
+    def forward(self, x, is_student):
         # convert to list
         if not isinstance(x, list):
             x = [x]
@@ -621,8 +621,11 @@ class MultiCropWrapper(nn.Module):
         start_idx, output = 0, torch.empty(0).to(x[0].device)
         for end_idx in idx_crops:
             d = x[start_idx].shape[2]
-            _out_no_pool = self.backbone(torch.cat(x[start_idx: end_idx]))
+            _out_no_pool, _out_recon = self.backbone(torch.cat(x[start_idx: end_idx]), is_student)
             _out_no_pool = _out_no_pool.reshape(-1, self.embed_dim, d // 32, d // 32)
+            if d == 256:
+                znorm = torch.mean(_out_no_pool**2)
+                recon = _out_recon
             _out = self.pool(_out_no_pool)
             _out = torch.flatten(_out, 1)
             # The output is a tuple with XCiT model. See:
@@ -633,8 +636,11 @@ class MultiCropWrapper(nn.Module):
             output = torch.cat((output, _out))
             start_idx = end_idx
         # Run the head forward on the concatenated features.
-        return self.head(output)
+        return self.head(output), znorm, recon
 
+
+    def get_last_layer(self):
+        return self.backbone.get_last_layer()
 
 def get_params_groups(model):
     regularized = []
