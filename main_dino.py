@@ -104,6 +104,7 @@ def get_args_parser():
         choices=['adamw', 'sgd', 'lars'], help="""Type of optimizer. We recommend using adamw with ViTs.""")
     parser.add_argument('--drop_path_rate', type=float, default=0.1, help="stochastic depth rate")
     parser.add_argument('--x_weight', type=float, default=0.0, help="x loss rate")
+    parser.add_argument('--aux_decoder', type=utils.bool_flag, default=True, help="use aux decoder or not")
 
     # Multi-crop parameters
     parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.4, 1.),
@@ -190,11 +191,11 @@ def train_dino(args):
         teacher = torchvision_models.__dict__[args.arch]()
         embed_dim = student.fc.weight.shape[1]
     elif args.arch == "flow":
-        student = PIXELVAE()
+        student = PIXELVAE(aux_decoder=args.aux_decoder)
         teacher = copy.deepcopy(student)
         embed_dim = student.fc.weight.shape[1]
     elif args.arch == "flowfast":
-        student = PIXELVAEfast()
+        student = PIXELVAEfast(aux_decoder=args.aux_decoder)
         teacher = copy.deepcopy(student)
         embed_dim = student.fc.weight.shape[1]
     else:
@@ -347,10 +348,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, linear_classifier, di
 
         with torch.amp.autocast(dtype=torch.bfloat16, device_type='cuda', enabled=args.use_fp16):
             image_ori = images[0]
-            image_global = torch.cat(images[1:3], dim=0)
+            image_global = torch.cat(images[1:2], dim=0)
             teacher_output, _, _ = teacher(images[1:3], is_student=False)  # only the 2 global views pass through the teacher
             student_output, znorm, xrecon = student(images[1:], is_student=(args.x_weight > 0))
-
             if args.x_weight > 0:
                 dloss = dino_loss(student_output, teacher_output, epoch)
                 xloss = torch.mean((image_global - xrecon)**2)
@@ -360,7 +360,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, linear_classifier, di
                 xweight = torch.norm(dloss_grad) / (torch.norm(xloss_grad) + 1e-4)
                 xweight = torch.clamp(xweight, 0.0, 1e4).detach()
                 loss = dloss + xloss * xweight * args.x_weight
-                psnr = torch.mean(get_psnr(image_global, xrecon, zero_mean=True))    
+                psnr = torch.mean(get_psnr(image_global, xrecon, zero_mean=True))
             else:
                 loss = dino_loss(student_output, teacher_output, epoch)
                 psnr = torch.zeros_like(loss)

@@ -389,7 +389,7 @@ class PixelUnshuffle2d(INNAbstract.PixelShuffleModule):
         return self.shuffle(x)
 
 class PIXELVAEfast(nn.Module):
-    def __init__(self, use_flow=True, *args, **kwargs):
+    def __init__(self, aux_decoder, *args, **kwargs):
         super().__init__()
 
         self.flow = INN.Sequential(
@@ -411,7 +411,9 @@ class PIXELVAEfast(nn.Module):
         self.ps = INN.PixelShuffle2d(2)
         self.flow.computing_p(True)
         self.flow_lam = 1
-        self.decoder = Decoder(out_ch=3, ch_mult=[1, 1, 1, 1, 1], num_res_blocks=1, z_channels=768, mid_attn=False)
+        self.aux_decoder = aux_decoder
+        if self.aux_decoder:
+            self.decoder = Decoder(out_ch=3, ch_mult=[1, 1, 1, 1, 1], num_res_blocks=1, z_channels=768, mid_attn=False)
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Linear(3072, 1000)
 
@@ -425,10 +427,13 @@ class PIXELVAEfast(nn.Module):
         x = self.flow.inverse(z)
         return dictdot(dict(sample=x))
 
-    def forward(self, x, is_student):
+    def forward(self, x, is_student, student_bs=0):
         z = self.encode(x)
         if is_student:
-            xhat = self.decoder(z)
+            if self.aux_decoder:
+                xhat = self.decoder(z[:student_bs])
+            else:
+                xhat = self.flow.inverse(z[:student_bs])
         else:
             xhat = None
         z = self.avgpool(self.ps(z)[0])
@@ -441,7 +446,7 @@ class PIXELVAEfast(nn.Module):
 
 
 class PIXELVAE(nn.Module):
-    def __init__(self, use_flow=True, *args, **kwargs):
+    def __init__(self, aux_decoder, *args, **kwargs):
         super().__init__()
 
         self.flow = INN.Sequential(
@@ -463,7 +468,9 @@ class PIXELVAE(nn.Module):
         self.ps = INN.PixelShuffle2d(2)
         self.flow.computing_p(True)
         self.flow_lam = 1
-        self.decoder = Decoder(out_ch=3, ch_mult=[1, 1, 1, 1, 1], num_res_blocks=1, z_channels=768, mid_attn=False)
+        self.aux_decoder = aux_decoder
+        if self.aux_decoder:
+            self.decoder = Decoder(out_ch=3, ch_mult=[1, 1, 1, 1, 1], num_res_blocks=1, z_channels=768, mid_attn=False)
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Linear(3072, 1000)
 
@@ -477,10 +484,13 @@ class PIXELVAE(nn.Module):
         x = self.flow.inverse(z)
         return dictdot(dict(sample=x))
 
-    def forward(self, x, is_student):
+    def forward(self, x, is_student, student_bs=0):
         z = self.encode(x)
         if is_student:
-            xhat = self.decoder(z)
+            if self.aux_decoder:
+                xhat = self.decoder(z[:student_bs])
+            else:
+                xhat = self.flow.inverse(z[:student_bs])
         else:
             xhat = None
         z = self.avgpool(self.ps(z)[0])
@@ -495,6 +505,7 @@ class PIXELVAE(nn.Module):
 if __name__ == "__main__":
     vae = PIXELVAEfast().cuda()
     x = torch.randn([4,3,256,256]).cuda()
-    z = vae.encode(x)
-    xhat = vae.decode(z).sample
+    with torch.amp.autocast(dtype=torch.bfloat16, device_type='cuda'):
+        z = vae.encode(x)
+        xhat = vae.decode(z).sample
     print(torch.mean((x - xhat)**2))

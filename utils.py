@@ -612,8 +612,8 @@ class MultiCropWrapper(nn.Module):
         )[1], 0)
         start_idx, output = 0, torch.empty(0).to(x[0].device)
         for end_idx in idx_crops:
-            d = x[start_idx].shape[2]
-            _out_no_pool, _out_recon = self.backbone(torch.cat(x[start_idx: end_idx]), is_student)
+            bs, _, d, _ = x[start_idx].shape
+            _out_no_pool, _out_recon = self.backbone(torch.cat(x[start_idx: end_idx]), is_student and (d == 256), student_bs=bs)
             _out_no_pool = _out_no_pool.reshape(-1, self.embed_dim, d // 32, d // 32)
             if d == 256:
                 znorm = torch.mean(_out_no_pool**2)
